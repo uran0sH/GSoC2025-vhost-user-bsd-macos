@@ -1,0 +1,13 @@
+qemu-system-aarch64 \
+    -m 256 \
+    -machine virt \
+    -accel hvf  \
+    -cpu host \
+    -nographic \
+    -smp 4 \
+    -kernel ../../img/std-vmlinux-6.6.bin \
+    -append "console=ttyAMA0 root=/dev/vda rw" \
+    -drive if=none,id=image,file=../../img/openEuler-24.03-LTS-stratovirt-aarch64.img,format=raw \
+    -device virtio-blk-device,drive=image \
+    -serial stdio \
+    -nodefaults
