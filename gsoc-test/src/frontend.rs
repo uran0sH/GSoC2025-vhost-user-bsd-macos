@@ -3,8 +3,8 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::thread::sleep;
 use std::time::Duration;
-use vmm_sys_util::eventfd::EventFd;
-use vmm_sys_util::sock_ctrl_msg::ScmSocket;
+
+use crate::sock_ctrl_msg::ScmSocket;
 mod errno;
 mod sock_ctrl_msg;
 
@@ -46,7 +46,7 @@ fn main() {
     println!("Frontend: connect and send FD");
     let socket = UnixStream::connect("vhost-fake.sck").expect("failed to connect to frontend");
     socket
-        .send_with_fds(&[[237].as_ref()], &[read_fd.as_raw_fd()])
+        .send_with_fds(&[[237].as_ref()], &[read_fd.as_raw_fd(), write_fd.as_raw_fd()])
         .expect("failed to send FD");
 
     for e in 0..3 {
