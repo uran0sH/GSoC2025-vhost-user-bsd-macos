@@ -9,14 +9,16 @@
 //! control messages (e.g. Unix domain sockets).
 
 use std::fs::File;
-use std::mem::size_of;
+use std::mem::{self, size_of};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::ptr::{copy_nonoverlapping, null_mut, write_unaligned};
+use std::{io, result};
 
 use crate::errno::{Error, Result};
 use libc::{
-    MSG_NOSIGNAL, SCM_RIGHTS, SOL_SOCKET, c_long, c_void, cmsghdr, iovec, msghdr, recvmsg, sendmsg,
+    MSG_NOSIGNAL, SCM_RIGHTS, SOL_SOCKET, c_long, c_void, cmsghdr, iovec, msghdr, read, recvmsg,
+    sendmsg,
 };
 use std::os::raw::c_int;
 
@@ -46,9 +48,18 @@ fn CMSG_DATA(cmsg_buffer: *mut cmsghdr) -> *mut RawFd {
 }
 
 #[cfg(not(target_env = "musl"))]
+#[cfg(target_os = "linux")]
 macro_rules! CMSG_LEN {
     ($len:expr) => {
-        size_of::<cmsghdr>() + ($len)
+        (size_of::<cmsghdr>() + ($len))
+    };
+}
+
+#[cfg(not(target_env = "musl"))]
+#[cfg(target_os = "macos")]
+macro_rules! CMSG_LEN {
+    ($len:expr) => {
+        (size_of::<cmsghdr>() + ($len)) as u32
     };
 }
 
@@ -67,7 +78,10 @@ fn new_msghdr(iovecs: &mut [iovec]) -> msghdr {
         msg_name: null_mut(),
         msg_namelen: 0,
         msg_iov: iovecs.as_mut_ptr(),
+        #[cfg(target_os = "linux")]
         msg_iovlen: iovecs.len(),
+        #[cfg(target_os = "macos")]
+        msg_iovlen: iovecs.len() as i32,
         msg_control: null_mut(),
         msg_controllen: 0,
         msg_flags: 0,
@@ -87,7 +101,14 @@ fn new_msghdr(iovecs: &mut [iovec]) -> msghdr {
 
 #[cfg(not(target_env = "musl"))]
 fn set_msg_controllen(msg: &mut msghdr, cmsg_capacity: usize) {
-    msg.msg_controllen = cmsg_capacity;
+    #[cfg(target_os = "linux")]
+    {
+        msg.msg_controllen = cmsg_capacity;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        msg.msg_controllen = cmsg_capacity as u32;
+    }
 }
 
 #[cfg(target_env = "musl")]
@@ -455,10 +476,67 @@ unsafe impl IntoIovec for &[u8] {
     }
 }
 
+pub struct PipeFd {
+    read_fd: RawFd,
+    write_fd: RawFd,
+}
+
+impl PipeFd {
+    pub fn write(&self, v: u64) -> result::Result<(), io::Error> {
+        let ret = unsafe {
+            use libc::write;
+            write(
+                self.read_fd,
+                &v as *const u64 as *const c_void,
+                mem::size_of::<u64>(),
+            )
+        };
+        if ret <= 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn read(&self) -> result::Result<u64, io::Error> {
+        let mut buf: u64 = 0;
+        // SAFETY: This is safe because we made this fd and the pointer we
+        // pass can not overflow because we give the syscall's size parameter properly.
+        let ret = unsafe {
+            read(
+                self.read_fd.as_raw_fd(),
+                &mut buf as *mut u64 as *mut c_void,
+                mem::size_of::<u64>(),
+            )
+        };
+        if ret < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(buf)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn pipe() -> io::Result<PipeFd> {
+    let mut fds: [RawFd; 2] = [-1, -1];
+    let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if ret == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        // read, write
+        Ok(PipeFd {
+            read_fd: fds[0],
+            write_fd: fds[1],
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::undocumented_unsafe_blocks)]
     use super::*;
+    #[cfg(target_os = "linux")]
     use vmm_sys_util::eventfd::EventFd;
 
     use std::io::Write;
@@ -532,6 +610,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn send_recv_only_fd() {
         let (s1, s2) = UnixDatagram::pair().expect("failed to create socket pair");
 
@@ -562,11 +641,21 @@ mod tests {
     fn send_recv_with_fd() {
         let (s1, s2) = UnixDatagram::pair().expect("failed to create socket pair");
 
+        #[cfg(target_os = "linux")]
         let evt = EventFd::new(0).expect("failed to create eventfd");
+        #[cfg(target_os = "linux")]
         let write_count = s1
             .send_with_fds(&[[237].as_ref()], &[evt.as_raw_fd()])
             .expect("failed to send fd");
-
+        #[cfg(target_os = "macos")]
+        let pipe_fd = pipe().expect("failed to create pipefd");
+        #[cfg(target_os = "macos")]
+        let write_count = s1
+            .send_with_fds(
+                &[[237].as_ref()],
+                &[pipe_fd.write_fd.as_raw_fd(), pipe_fd.read_fd.as_raw_fd()],
+            )
+            .expect("failed to send fd");
         assert_eq!(write_count, 1);
 
         let mut files = [0; 2];
@@ -582,18 +671,27 @@ mod tests {
 
         assert_eq!(read_count, 1);
         assert_eq!(buf[0], 237);
+        #[cfg(target_os = "linux")]
         assert_eq!(file_count, 1);
+        #[cfg(target_os = "macos")]
+        assert_eq!(file_count, 2);
         assert!(files[0] >= 0);
         assert_ne!(files[0], s1.as_raw_fd());
         assert_ne!(files[0], s2.as_raw_fd());
+        #[cfg(target_os = "linux")]
         assert_ne!(files[0], evt.as_raw_fd());
+        #[cfg(target_os = "macos")]
+        assert_ne!(files[0], pipe_fd.read_fd.as_raw_fd());
 
         let mut file = unsafe { File::from_raw_fd(files[0]) };
 
         file.write_all(unsafe { from_raw_parts(&1203u64 as *const u64 as *const u8, 8) })
             .expect("failed to write to sent fd");
 
+         #[cfg(target_os = "linux")]
         assert_eq!(evt.read().expect("failed to read from eventfd"), 1203);
+        #[cfg(target_os = "macos")]
+        assert_eq!(pipe_fd.read().expect("failed to read from pipfd"), 1203);
     }
 
     #[test]
@@ -602,12 +700,13 @@ mod tests {
     fn send_more_recv_less1() {
         let (s1, s2) = UnixDatagram::pair().expect("failed to create socket pair");
 
-        let evt1 = EventFd::new(0).expect("failed to create eventfd");
-        let evt2 = EventFd::new(0).expect("failed to create eventfd");
-        let evt3 = EventFd::new(0).expect("failed to create eventfd");
-        let evt4 = EventFd::new(0).expect("failed to create eventfd");
-        let write_count = s1
-            .send_with_fds(
+        #[cfg(target_os = "linux")]
+        let write_count = {
+            let evt1 = EventFd::new(0).expect("failed to create eventfd");
+            let evt2 = EventFd::new(0).expect("failed to create eventfd");
+            let evt3 = EventFd::new(0).expect("failed to create eventfd");
+            let evt4 = EventFd::new(0).expect("failed to create eventfd");
+            s1.send_with_fds(
                 &[[237].as_ref()],
                 &[
                     evt1.as_raw_fd(),
@@ -616,8 +715,29 @@ mod tests {
                     evt4.as_raw_fd(),
                 ],
             )
-            .expect("failed to send fd");
-
+            .expect("failed to send fd")
+        };
+        #[cfg(target_os = "macos")]
+        let write_count = {
+            let pip1 = pipe().expect("failed to create eventfd");
+            let pip2 = pipe().expect("failed to create eventfd");
+            let pip3 = pipe().expect("failed to create eventfd");
+            let pip4 = pipe().expect("failed to create eventfd");
+            s1.send_with_fds(
+                &[[237].as_ref()],
+                &[
+                    pip1.write_fd.as_raw_fd(),
+                    pip1.read_fd.as_raw_fd(),
+                    pip2.write_fd.as_raw_fd(),
+                    pip2.read_fd.as_raw_fd(),
+                    pip3.write_fd.as_raw_fd(),
+                    pip3.read_fd.as_raw_fd(),
+                    pip4.write_fd.as_raw_fd(),
+                    pip4.read_fd.as_raw_fd(),
+                ],
+            )
+            .expect("failed to send fd")
+        };
         assert_eq!(write_count, 1);
 
         let mut files = [0; 2];
@@ -635,12 +755,13 @@ mod tests {
     fn send_more_recv_less2() {
         let (s1, s2) = UnixDatagram::pair().expect("failed to create socket pair");
 
-        let evt1 = EventFd::new(0).expect("failed to create eventfd");
-        let evt2 = EventFd::new(0).expect("failed to create eventfd");
-        let evt3 = EventFd::new(0).expect("failed to create eventfd");
-        let evt4 = EventFd::new(0).expect("failed to create eventfd");
-        let write_count = s1
-            .send_with_fds(
+        #[cfg(target_os = "linux")]
+        let write_count = {
+            let evt1 = EventFd::new(0).expect("failed to create eventfd");
+            let evt2 = EventFd::new(0).expect("failed to create eventfd");
+            let evt3 = EventFd::new(0).expect("failed to create eventfd");
+            let evt4 = EventFd::new(0).expect("failed to create eventfd");
+            s1.send_with_fds(
                 &[[237].as_ref()],
                 &[
                     evt1.as_raw_fd(),
@@ -649,8 +770,29 @@ mod tests {
                     evt4.as_raw_fd(),
                 ],
             )
-            .expect("failed to send fd");
-
+            .expect("failed to send fd")
+        };
+        #[cfg(target_os = "macos")]
+        let write_count = {
+            let pip1 = pipe().expect("failed to create eventfd");
+            let pip2 = pipe().expect("failed to create eventfd");
+            let pip3 = pipe().expect("failed to create eventfd");
+            let pip4 = pipe().expect("failed to create eventfd");
+            s1.send_with_fds(
+                &[[237].as_ref()],
+                &[
+                    pip1.write_fd.as_raw_fd(),
+                    pip1.read_fd.as_raw_fd(),
+                    pip2.write_fd.as_raw_fd(),
+                    pip2.read_fd.as_raw_fd(),
+                    pip3.write_fd.as_raw_fd(),
+                    pip3.read_fd.as_raw_fd(),
+                    pip4.write_fd.as_raw_fd(),
+                    pip4.read_fd.as_raw_fd(),
+                ],
+            )
+            .expect("failed to send fd")
+        };
         assert_eq!(write_count, 1);
 
         let mut files = [0; 1];
