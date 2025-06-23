@@ -17,7 +17,7 @@ use std::{io, result};
 
 use crate::errno::{Error, Result};
 use libc::{
-    MSG_NOSIGNAL, SCM_RIGHTS, SOL_SOCKET, c_long, c_void, cmsghdr, iovec, msghdr, read, recvmsg,
+    MSG_NOSIGNAL, SCM_RIGHTS, SOL_SOCKET, c_long, c_uint, c_void, cmsghdr, iovec, msghdr, read, recvmsg,
     sendmsg,
 };
 use std::os::raw::c_int;
@@ -31,9 +31,24 @@ macro_rules! CMSG_ALIGN {
     };
 }
 
+#[cfg(target_os = "linux")]
 macro_rules! CMSG_SPACE {
     ($len:expr) => {
         size_of::<cmsghdr>() + CMSG_ALIGN!($len)
+    };
+}
+
+#[cfg(target_os = "macos")]
+macro_rules! DARWIN_ALIGN32 {
+    ($len:expr) => {
+        (($len) + size_of::<c_uint>() - 1) & !(size_of::<c_uint>() - 1)
+    }
+}
+
+#[cfg(target_os = "macos")]
+macro_rules! CMSG_SPACE {
+    ($len:expr) => {
+        DARWIN_ALIGN32!(size_of::<cmsghdr>()) + DARWIN_ALIGN32!($len)
     };
 }
 
@@ -59,7 +74,7 @@ macro_rules! CMSG_LEN {
 #[cfg(target_os = "macos")]
 macro_rules! CMSG_LEN {
     ($len:expr) => {
-        (size_of::<cmsghdr>() + ($len)) as u32
+        (DARWIN_ALIGN32!(size_of::<cmsghdr>()) + ($len)) as u32
     };
 }
 
@@ -550,9 +565,15 @@ mod tests {
     #[test]
     fn buffer_len() {
         assert_eq!(CMSG_SPACE!(0), size_of::<cmsghdr>());
+        #[cfg(target_os = "linux")]
         assert_eq!(
             CMSG_SPACE!(size_of::<RawFd>()),
             size_of::<cmsghdr>() + size_of::<c_long>()
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            CMSG_SPACE!(size_of::<RawFd>()),
+            size_of::<cmsghdr>() + size_of::<c_uint>()
         );
         if size_of::<RawFd>() == 4 {
             assert_eq!(
@@ -561,7 +582,7 @@ mod tests {
             );
             assert_eq!(
                 CMSG_SPACE!(3 * size_of::<RawFd>()),
-                size_of::<cmsghdr>() + size_of::<c_long>() * 2
+                size_of::<cmsghdr>() + size_of::<c_uint>() * 3
             );
             assert_eq!(
                 CMSG_SPACE!(4 * size_of::<RawFd>()),
@@ -653,7 +674,7 @@ mod tests {
         let write_count = s1
             .send_with_fds(
                 &[[237].as_ref()],
-                &[pipe_fd.write_fd.as_raw_fd(), pipe_fd.read_fd.as_raw_fd()],
+                &[pipe_fd.write_fd.as_raw_fd()],
             )
             .expect("failed to send fd");
         assert_eq!(write_count, 1);
@@ -674,7 +695,7 @@ mod tests {
         #[cfg(target_os = "linux")]
         assert_eq!(file_count, 1);
         #[cfg(target_os = "macos")]
-        assert_eq!(file_count, 2);
+        assert_eq!(file_count, 1);
         assert!(files[0] >= 0);
         assert_ne!(files[0], s1.as_raw_fd());
         assert_ne!(files[0], s2.as_raw_fd());
