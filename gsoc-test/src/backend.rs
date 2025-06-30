@@ -58,7 +58,7 @@ fn main() {
             .expect("failed to recv fd")
     };
 
-    assert_eq!(file_count, 2, "checking the number of received fds");
+    assert_eq!(file_count, 1, "checking the number of received fds");
     assert!(files[0] >= 0);
 
     let fd = files[0];

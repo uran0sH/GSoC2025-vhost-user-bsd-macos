@@ -4,7 +4,8 @@ use std::os::unix::net::UnixStream;
 use std::thread::sleep;
 use std::time::Duration;
 
-use crate::sock_ctrl_msg::ScmSocket;
+use crate::sock_ctrl_msg::{PipeFd, ScmSocket};
+use vmm_sys_util::EventNotifier;
 mod errno;
 mod sock_ctrl_msg;
 
@@ -41,19 +42,27 @@ pub fn pipe() -> io::Result<(RawFd, RawFd)> {
 fn main() {
     println!("Frontend: start");
 
-    let (read_fd, write_fd) = pipe().expect("pipe failed");
+    let evt = EventNotifier::new(0).expect("pipe failed");
 
     println!("Frontend: connect and send FD");
     let socket = UnixStream::connect("vhost-fake.sck").expect("failed to connect to frontend");
+    #[cfg(target_os = "macos")]
     socket
-        .send_with_fds(&[[237].as_ref()], &[read_fd.as_raw_fd(), write_fd.as_raw_fd()])
+        .send_with_fds(&[[237].as_ref()], &[evt.get_rfd()])
+        .expect("failed to send FD");
+    #[cfg(target_os = "linux")]
+    socket
+        .send_with_fds(&[[237].as_ref()], &[evt.as_raw_fd()])
         .expect("failed to send FD");
 
     for e in 0..3 {
         sleep(Duration::from_secs(2));
 
         println!("Frontend: send event: {e}");
-        send_event(write_fd.as_raw_fd()).expect("failed to send event");
+        #[cfg(target_os = "macos")]
+        send_event(evt.get_wfd()).expect("failed to send event");
+        #[cfg(target_os = "linux")]
+        send_event(evt.as_raw_fd()).expect("failed to send event"); 
     }
 
     println!("Frontend: done");
